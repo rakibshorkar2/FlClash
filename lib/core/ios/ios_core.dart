@@ -2,12 +2,8 @@ import 'dart:async';
 
 import 'package:fl_clash/common/common.dart';
 import 'package:fl_clash/core/core.dart';
-import 'package:fl_clash/enum/enum.dart';
 import 'package:fl_clash/models/models.dart';
 import 'package:flutter/services.dart';
-
-import '../interface.dart';
-import '../method.dart';
 
 /// iOS Core driver.
 ///

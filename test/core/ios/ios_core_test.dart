@@ -1,22 +1,28 @@
-import 'package:fl_clash/core/controller.dart';
-import 'package:fl_clash/core/event.dart';
-import 'package:fl_clash/core/interface.dart';
-import 'package:fl_clash/core/ios/ios_core.dart';
-import 'package:fl_clash/enum/enum.dart';
+import 'package:fl_clash/core/core.dart';
+import 'package:fl_clash/models/models.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+
+class _TestListener with CoreEventListener {
+  Log? receivedLog;
+
+  @override
+  void onLog(Log log) {
+    receivedLog = log;
+  }
+}
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   const channel = MethodChannel('fl_clash/core_ios');
-  final log = <MethodCall>[];
+  final logCalls = <MethodCall>[];
 
   setUp(() {
-    log.clear();
+    logCalls.clear();
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (call) async {
-          log.add(call);
+          logCalls.add(call);
           switch (call.method) {
             case 'start':
               return true;
@@ -48,7 +54,7 @@ void main() {
       final result = await core.start();
 
       expect(result.outcome, CoreLifecycleOutcome.applied);
-      expect(log.any((call) => call.method == 'start'), isTrue);
+      expect(logCalls.any((call) => call.method == 'start'), isTrue);
     });
 
     test('coalesces repeated start calls when already connected', () async {
@@ -66,7 +72,7 @@ void main() {
       final stopResult = await core.stop();
 
       expect(stopResult.outcome, CoreLifecycleOutcome.applied);
-      expect(log.any((call) => call.method == 'stop'), isTrue);
+      expect(logCalls.any((call) => call.method == 'stop'), isTrue);
     });
 
     test('invokeMethod dispatches structured method call and receives response', () async {
@@ -79,34 +85,32 @@ void main() {
       );
 
       expect(res, 'ok');
-      expect(log.any((call) => call.method == 'invokeMethod'), isTrue);
+      expect(logCalls.any((call) => call.method == 'invokeMethod'), isTrue);
     });
 
     test('event handler receives async push and dispatches to coreEventManager', () async {
       final core = IOSCore();
       await core.start();
 
-      CoreEvent? receivedEvent;
-      final listener = coreEventManager.addListener((event) {
-        receivedEvent = event;
-      });
+      final listener = _TestListener();
+      coreEventManager.addListener(listener);
 
-      final binaryMessenger = TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
-      final codec = const StandardMethodCodec();
+      const codec = StandardMethodCodec();
       final message = codec.encodeMethodCall(
         const MethodCall('event', [
           {
-            'type': 'traffic',
-            'data': {'up': 100, 'down': 200},
+            'type': 'log',
+            'data': {'logLevel': 'info', 'payload': 'test log'},
           }
         ]),
       );
 
+      final binaryMessenger = TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
       await binaryMessenger.handlePlatformMessage('fl_clash/core_ios', message, (_) {});
+      await Future<void>.delayed(const Duration(milliseconds: 10));
 
-      expect(receivedEvent, isNotNull);
-      expect(receivedEvent?.type, 'traffic');
-      listener.cancel();
+      expect(listener.receivedLog?.payload, 'test log');
+      coreEventManager.removeListener(listener);
     });
   });
 }
