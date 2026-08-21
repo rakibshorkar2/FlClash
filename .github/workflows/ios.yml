@@ -66,7 +66,6 @@ jobs:
         run: pod install --repo-update
 
       - name: Setup Keychain and Provisioning (Signed Mode)
-        if: ${{ inputs.signed == true || (secrets.APPLE_CERTIFICATE_BASE64 != '' && secrets.APPLE_PROVISIONING_PROFILE_BASE64 != '') }}
         env:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -74,20 +73,25 @@ jobs:
           APPLE_TUNNEL_PROVISIONING_PROFILE_BASE64: ${{ secrets.APPLE_TUNNEL_PROVISIONING_PROFILE_BASE64 }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD || 'temporary_ci_keychain_password' }}
         run: |
-          KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          if [ -n "$APPLE_CERTIFICATE_BASE64" ] && [ -n "$APPLE_PROVISIONING_PROFILE_BASE64" ]; then
+            echo "Setting up signing certificate and provisioning profiles..."
+            KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
+            security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+            security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+            security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > $RUNNER_TEMP/certificate.p12
-          security import $RUNNER_TEMP/certificate.p12 -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+            echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > $RUNNER_TEMP/certificate.p12
+            security import $RUNNER_TEMP/certificate.p12 -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+            security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+            security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
 
-          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
-          echo "$APPLE_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$HOME/Library/MobileDevice/Provisioning Profiles/app.mobileprovision"
-          if [ -n "$APPLE_TUNNEL_PROVISIONING_PROFILE_BASE64" ]; then
-            echo "$APPLE_TUNNEL_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$HOME/Library/MobileDevice/Provisioning Profiles/tunnel.mobileprovision"
+            mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+            echo "$APPLE_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$HOME/Library/MobileDevice/Provisioning Profiles/app.mobileprovision"
+            if [ -n "$APPLE_TUNNEL_PROVISIONING_PROFILE_BASE64" ]; then
+              echo "$APPLE_TUNNEL_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$HOME/Library/MobileDevice/Provisioning Profiles/tunnel.mobileprovision"
+            fi
+          else
+            echo "Signing secrets not provided. Proceeding with unsigned development build."
           fi
 
       - name: Build Flutter iOS Bundle
@@ -144,11 +148,18 @@ jobs:
           fi
 
       - name: Generate Build Report
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
         run: |
           APP_PATH="build/ios/ipa/Payload/FlClash.app"
           HAS_EXTENSION="NO"
           if [ -d "$APP_PATH/PlugIns/PacketTunnel.appex" ]; then
             HAS_EXTENSION="YES"
+          fi
+          
+          PROVISION_MODE="UNSIGNED (Ad-hoc / Sideload)"
+          if [ -n "$APPLE_CERTIFICATE_BASE64" ]; then
+            PROVISION_MODE="SIGNED"
           fi
           
           echo "========================================"
@@ -172,7 +183,7 @@ jobs:
           echo "  Sideloading Authorization: Requires Apple Developer Team signing certificate"
           echo ""
           echo "Provisioning:"
-          echo "  Mode: ${{ (inputs.signed == true || (secrets.APPLE_CERTIFICATE_BASE64 != '')) && 'SIGNED' || 'UNSIGNED (Ad-hoc / Sideload)' }}"
+          echo "  Mode: $PROVISION_MODE"
           echo ""
           echo "IPA Artifact:"
           echo "  Path: build/ios/ipa/FlClash-unsigned.ipa"
