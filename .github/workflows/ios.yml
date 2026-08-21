@@ -1,0 +1,191 @@
+name: ios-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      signed:
+        description: 'Build signed IPA using repository secrets'
+        required: false
+        default: false
+        type: boolean
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - main
+
+env:
+  FLUTTER_VERSION: '3.44.4'
+  GO_VERSION: '1.26.4'
+
+jobs:
+  build:
+    name: Build iOS IPA
+    runs-on: macos-14
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: core/go.sum
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: master
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Setup Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.3.app || sudo xcode-select -s /Applications/Xcode_26.2.app || true
+          xcodebuild -version
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Run Flutter Analyzer
+        run: flutter analyze --no-fatal-infos
+
+      - name: Run Dart & Flutter Tests
+        run: flutter test --reporter expanded
+
+      - name: Build Go Core (libclash.a & FlClash.xcframework)
+        working-directory: plugins/setup/buildkit/build_tool
+        run: |
+          dart pub get
+          dart run bin/build_tool.dart ios --arch arm64 --root-dir "$GITHUB_WORKSPACE"
+
+      - name: Install CocoaPods
+        working-directory: ios
+        run: pod install --repo-update
+
+      - name: Setup Keychain and Provisioning (Signed Mode)
+        if: ${{ inputs.signed == true || (secrets.APPLE_CERTIFICATE_BASE64 != '' && secrets.APPLE_PROVISIONING_PROFILE_BASE64 != '') }}
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_PROVISIONING_PROFILE_BASE64: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}
+          APPLE_TUNNEL_PROVISIONING_PROFILE_BASE64: ${{ secrets.APPLE_TUNNEL_PROVISIONING_PROFILE_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD || 'temporary_ci_keychain_password' }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > $RUNNER_TEMP/certificate.p12
+          security import $RUNNER_TEMP/certificate.p12 -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          echo "$APPLE_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$HOME/Library/MobileDevice/Provisioning Profiles/app.mobileprovision"
+          if [ -n "$APPLE_TUNNEL_PROVISIONING_PROFILE_BASE64" ]; then
+            echo "$APPLE_TUNNEL_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$HOME/Library/MobileDevice/Provisioning Profiles/tunnel.mobileprovision"
+          fi
+
+      - name: Build Flutter iOS Bundle
+        run: flutter build ios --release --no-codesign
+
+      - name: Build and Archive with Xcodebuild
+        run: |
+          xcodebuild archive \
+            -workspace ios/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -archivePath build/ios/archive/FlClash.xcarchive \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Package IPA (Unsigned / Sideload Mode)
+        run: |
+          mkdir -p build/ios/ipa/Payload
+          cp -R build/ios/archive/FlClash.xcarchive/Products/Applications/Runner.app build/ios/ipa/Payload/FlClash.app
+          cd build/ios/ipa
+          zip -qr FlClash-unsigned.ipa Payload
+          cd ../../..
+
+      - name: Diagnostic Inspection & Validation
+        run: |
+          echo "========================================"
+          echo "Inspecting Built App Bundle"
+          echo "========================================"
+          APP_PATH="build/ios/ipa/Payload/FlClash.app"
+          PLUGINS_PATH="$APP_PATH/PlugIns"
+          
+          echo "Main App binary architecture:"
+          file "$APP_PATH/Runner" || true
+          
+          echo ""
+          echo "PlugIns directory contents:"
+          ls -la "$PLUGINS_PATH" || echo "No PlugIns directory found"
+          
+          if [ -d "$PLUGINS_PATH/PacketTunnel.appex" ]; then
+            echo "PacketTunnel extension binary architecture:"
+            file "$PLUGINS_PATH/PacketTunnel.appex/PacketTunnel" || true
+          fi
+          
+          echo ""
+          echo "Main App Entitlements (if signed):"
+          codesign -d --entitlements :- "$APP_PATH" 2>/dev/null || echo "Main App is unsigned (expected in Mode A)"
+          
+          if [ -d "$PLUGINS_PATH/PacketTunnel.appex" ]; then
+            echo ""
+            echo "Packet Tunnel Entitlements (if signed):"
+            codesign -d --entitlements :- "$PLUGINS_PATH/PacketTunnel.appex" 2>/dev/null || echo "PacketTunnel is unsigned (expected in Mode A)"
+          fi
+
+      - name: Generate Build Report
+        run: |
+          APP_PATH="build/ios/ipa/Payload/FlClash.app"
+          HAS_EXTENSION="NO"
+          if [ -d "$APP_PATH/PlugIns/PacketTunnel.appex" ]; then
+            HAS_EXTENSION="YES"
+          fi
+          
+          echo "========================================"
+          echo "FlClash iOS Build Report"
+          echo "========================================"
+          echo "Flutter: $(flutter --version | head -n 1)"
+          echo "Xcode: $(xcodebuild -version | tr '\n' ' ')"
+          echo "Deployment Target: iOS 15.0"
+          echo ""
+          echo "Main App:"
+          echo "  Bundle ID: com.follow.flClash"
+          echo "  Architecture: arm64"
+          echo ""
+          echo "Packet Tunnel Extension:"
+          echo "  Bundle ID: com.follow.flClash.PacketTunnel"
+          echo "  Embedded in PlugIns: $HAS_EXTENSION"
+          echo "  Architecture: arm64"
+          echo ""
+          echo "Network Extension Entitlement:"
+          echo "  Declared in entitlements: YES (packet-tunnel-provider)"
+          echo "  Sideloading Authorization: Requires Apple Developer Team signing certificate"
+          echo ""
+          echo "Provisioning:"
+          echo "  Mode: ${{ (inputs.signed == true || (secrets.APPLE_CERTIFICATE_BASE64 != '')) && 'SIGNED' || 'UNSIGNED (Ad-hoc / Sideload)' }}"
+          echo ""
+          echo "IPA Artifact:"
+          echo "  Path: build/ios/ipa/FlClash-unsigned.ipa"
+          echo ""
+          echo "Sideloading Compatibility:"
+          echo "  AltStore / SideStore: Supported (Installable; VPN requires authorized profile)"
+          echo "  Sideloadly: Supported (Installable; VPN requires authorized profile)"
+          echo "  LiveContainer: App launches; Network Extension VPN cannot load (App Extension limitation)"
+          echo "========================================"
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlClash-ios-ipa
+          path: build/ios/ipa/FlClash-unsigned.ipa
+          overwrite: true

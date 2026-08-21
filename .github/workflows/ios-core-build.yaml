@@ -1,0 +1,60 @@
+name: ios-core-build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build iOS Go core
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.9'
+          cache-dependency-path: core/go.sum
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: master
+          flutter-version: '3.44.4'
+          cache: true
+
+      - name: Verify toolchain
+        run: |
+          xcodebuild -version
+          go version
+
+      - name: Validate build tool
+        working-directory: plugins/setup/buildkit/build_tool
+        run: |
+          dart pub get
+          dart analyze
+          dart test
+
+      - name: Build iOS core
+        working-directory: plugins/setup/buildkit/build_tool
+        run: |
+          dart run bin/build_tool.dart ios --arch arm64 --root-dir "$GITHUB_WORKSPACE"
+
+      - name: Inspect artifacts
+        run: |
+          ls -la libclash/ios
+          ls -la libclash/ios/includes
+          ls -la libclash/ios/FlClash.xcframework
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: libclash-ios
+          path: |
+            libclash/ios/libclash.a
+            libclash/ios/includes
+            libclash/ios/FlClash.xcframework
+          overwrite: true
